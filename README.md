@@ -45,8 +45,8 @@ docker restart music_assistant
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
 | 服务端地址 | LX Music 服务端 URL | `http://localhost:9527` |
-| 用户名 | 服务端登录用户名 | `admin` |
-| 密码 | 服务端登录密码 | 空 |
+| 用户名 | 服务端登录用户名 | lxserver账号，默认`admin` |
+| 密码 | 服务端登录密码 | lxserver登录密码 |
 | 默认音源 | 获取播放链接优先音源 | `wy` |
 | 搜索音源 | 搜索轮询的音源列表 | `kw,kg,tx,wy,mg` |
 
