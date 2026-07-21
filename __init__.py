@@ -95,9 +95,9 @@ async def get_config_entries(
             key=CONF_SERVER_URL,
             type=ConfigEntryType.STRING,
             label="服务端地址",
-            default_value="http://192.168.1.10:9527",
+            default_value="http://localhost:9527",
             required=True,
-            description="LX Music 服务端的完整 URL，例如 http://192.168.1.10:9527",
+            description="LX Music 服务端的完整 URL，例如 http://localhost:9527",
         ),
         ConfigEntry(
             key=CONF_USERNAME,
@@ -154,6 +154,9 @@ class LxMusicProvider(MusicProvider):
         self._artist_cache: dict[str, dict[str, Any]] = {}
         self._album_cache: dict[str, dict[str, Any]] = {}
         self._playlist_cache: dict[str, list[dict[str, Any]]] = {}
+        # 广场/网络歌单元数据缓存：item_id -> {name, source, id, img, ...}
+        # 供 get_playlist/_build_square_playlist 回填歌单名与封面
+        self._square_meta: dict[str, dict[str, Any]] = {}
         # 按专辑 aid 缓存已解析的 Track（搜索/歌手页解析过的同专辑歌曲，
         # 点击专辑时直接可用，避免依赖 albumId 或回搜失败导致专辑无曲目）
         self._album_tracks: dict[str, list[Track]] = {}
@@ -369,8 +372,13 @@ class LxMusicProvider(MusicProvider):
             ):
                 break
 
-        # 歌单搜索：按名称匹配用户自己的 lx 歌单（广场歌单无关键词 API，仅进浏览）
+        # 歌单搜索：先搜网络/广场歌单（songList/search），再按名称匹配用户自己的 lx 歌单
         if want_playlist:
+            seen_playlists: set[str] = set()
+            for pl in await self._search_song_lists(keyword, limit=limit):
+                if pl.item_id not in seen_playlists:
+                    seen_playlists.add(pl.item_id)
+                    results.playlists.append(pl)
             data = await self._get_user_lists()
             if data:
                 kw = keyword.lower()
@@ -406,6 +414,82 @@ class LxMusicProvider(MusicProvider):
                             )
                         )
         return results
+
+    async def _search_song_lists(
+        self, keyword: str, limit: int = 25
+    ) -> list[Playlist]:
+        """搜索网络/广场歌单（lxserver /api/music/songList/search）。
+
+        遍历配置的音源，把命中的歌单转成 sl:<source>:<id> 的 Playlist，
+        并缓存歌单名/封面到 _square_meta，供打开歌单时回填。
+        """
+        if not keyword:
+            return []
+        out: list[Playlist] = []
+        seen: set[str] = set()
+        for source in self._search_sources:
+            try:
+                result = await self._request(
+                    "GET",
+                    "/api/music/songList/search",
+                    params={
+                        "source": source,
+                        "text": keyword,
+                        "page": 1,
+                        "limit": max(5, limit // max(1, len(self._search_sources))),
+                    },
+                )
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("songList/search 音源 %s 失败: %s", source, err)
+                continue
+            for sl in self._normalize_list(result):
+                sl_id = sl.get("id") or sl.get("listId") or sl.get("playId")
+                if not sl_id:
+                    continue
+                sl_source = sl.get("source") or source
+                item_id = f"sl:{sl_source}:{sl_id}"
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                sl_name = sl.get("name") or sl.get("listName") or str(sl_id)
+                sl_img = (
+                    sl.get("img")
+                    or sl.get("pic")
+                    or sl.get("image")
+                    or sl.get("cover")
+                    or sl.get("coverImgUrl")
+                )
+                self._square_meta[item_id] = {
+                    "source": sl_source,
+                    "id": str(sl_id),
+                    "name": sl_name,
+                    "img": sl_img,
+                }
+                playlist = Playlist(
+                    item_id=item_id,
+                    provider=self.instance_id,
+                    name=sl_name,
+                    provider_mappings={
+                        ProviderMapping(
+                            item_id=item_id,
+                            provider_domain=self.domain,
+                            provider_instance=self.instance_id,
+                        )
+                    },
+                )
+                if sl_img:
+                    playlist.metadata.images = [
+                        MediaItemImage(
+                            type=ImageType.THUMB,
+                            path=sl_img,
+                            provider=self.instance_id,
+                            remotely_accessible=True,
+                        )
+                    ]
+                out.append(playlist)
+                if len(out) >= limit:
+                    return out
+        return out
 
     async def browse(self, path: str | None = None) -> BrowseFolder:
         """Browse the LX Music provider."""
@@ -543,10 +627,23 @@ class LxMusicProvider(MusicProvider):
                     sl_source = sl.get("source") or self._default_source
                     if not sl_id:
                         continue
+                    sl_item_id = f"sl:{sl_source}:{sl_id}"
+                    self._square_meta[sl_item_id] = {
+                        "source": sl_source,
+                        "id": str(sl_id),
+                        "name": sl_name,
+                        "img": (
+                            sl.get("img")
+                            or sl.get("pic")
+                            or sl.get("image")
+                            or sl.get("cover")
+                            or sl.get("coverImgUrl")
+                        ),
+                    }
                     folder.items.append(
                         ItemMapping(
                             media_type=MediaType.PLAYLIST,
-                            item_id=f"sl:{sl_source}:{sl_id}",
+                            item_id=sl_item_id,
                             provider=self.instance_id,
                             name=sl_name,
                         )
@@ -580,14 +677,16 @@ class LxMusicProvider(MusicProvider):
         raise FileNotFoundError(f"Track {prov_track_id} not found")
 
     async def get_album(self, prov_album_id: str) -> Album:
-        """专辑：优先用真实 albumId 拉取歌曲；失败则按专辑名回搜过滤兜底。"""
+        """专辑元数据。
+
+        注意：当前 MA 版本的 Album 模型不含 tracks 字段，曲目需在
+        get_album_tracks() 中单独返回，这里只构建元数据。
+        """
         info = self._album_cache.get(prov_album_id)
-        source = info["source"] if info else self._split_id(prov_album_id)[0]
-        real_id = info.get("real_id") if info else None
         album_name = (
             info["name"] if info else (self._split_id(prov_album_id)[1] or "未知专辑")
         )
-        album = Album(
+        return Album(
             item_id=prov_album_id,
             provider=self.instance_id,
             name=album_name or "未知专辑",
@@ -599,6 +698,15 @@ class LxMusicProvider(MusicProvider):
                 )
             },
         )
+
+    async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
+        """返回专辑曲目：优先真实 albumId，否则用缓存，最后按专辑名回搜。"""
+        info = self._album_cache.get(prov_album_id)
+        source = info["source"] if info else self._split_id(prov_album_id)[0]
+        real_id = info.get("real_id") if info else None
+        album_name = (
+            info["name"] if info else (self._split_id(prov_album_id)[1] or "未知专辑")
+        )
         # 1) 优先用真实 albumId 拉取完整专辑
         if real_id:
             try:
@@ -607,25 +715,28 @@ class LxMusicProvider(MusicProvider):
                     {"source": source, "id": real_id},
                     max_items=100,
                 )
+                out: list[Track] = []
                 for item in items:
                     track = await self._parse_track(item, source)
                     if track:
-                        album.tracks.append(track)
-                if album.tracks:
-                    return album
+                        out.append(track)
+                if out:
+                    return out
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("albumSongs 失败 %s: %s", prov_album_id, err)
         # 2) 用搜索/歌手页已解析的同专辑曲目兜底（最可靠，不依赖 albumId）
         cached = self._album_tracks.get(prov_album_id)
         if cached:
             seen_tracks: set[str] = set()
+            out = []
             for track in cached:
                 if track.item_id not in seen_tracks:
                     seen_tracks.add(track.item_id)
-                    album.tracks.append(track)
-            if album.tracks:
-                return album
+                    out.append(track)
+            if out:
+                return out
         # 3) 兜底：按专辑名回搜并过滤同名专辑
+        out = []
         if album_name and album_name != "未知专辑":
             try:
                 for src in self._search_sources:
@@ -635,12 +746,12 @@ class LxMusicProvider(MusicProvider):
                         if an and an == album_name:
                             track = await self._parse_track(item, src)
                             if track:
-                                album.tracks.append(track)
-                    if len(album.tracks) >= 20:
+                                out.append(track)
+                    if len(out) >= 20:
                         break
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("专辑回搜失败 %s: %s", prov_album_id, err)
-        return album
+        return out
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Artists：优先从缓存取名称，否则回退到 ID 拆分。"""
@@ -662,12 +773,16 @@ class LxMusicProvider(MusicProvider):
         )
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
-        """歌单：支持用户歌单 list:<id> 与广场歌单 sl:<source>:<id>。"""
+        """歌单元数据：支持用户歌单 list:<id> 与广场歌单 sl:<source>:<id>。
+
+        注意：当前 MA 版本的 Playlist 模型不含 tracks 字段，曲目需在
+        get_playlist_tracks() 中单独返回，这里只构建元数据。
+        """
         if prov_playlist_id.startswith("sl:"):
             parts = prov_playlist_id.split(":", 2)
             source = parts[1] if len(parts) > 1 else self._default_source
             sl_id = parts[2] if len(parts) > 2 else ""
-            return await self._build_square_playlist(source, sl_id)
+            return self._make_square_playlist(source, sl_id)
 
         pid = (
             prov_playlist_id[5:]
@@ -683,8 +798,9 @@ class LxMusicProvider(MusicProvider):
                     name = pl_name
                     songs = pl_songs
                     break
+        # 缓存原始歌曲列表，供 get_playlist_tracks 复用
         self._playlist_cache[prov_playlist_id] = songs
-        playlist = Playlist(
+        return Playlist(
             item_id=prov_playlist_id,
             provider=self.instance_id,
             name=name,
@@ -696,20 +812,15 @@ class LxMusicProvider(MusicProvider):
                 )
             },
         )
-        for item in songs:
-            src = item.get("source") or self._default_source
-            track = await self._parse_track(item, src)
-            if track:
-                playlist.tracks.append(track)
-        return playlist
 
-    async def _build_square_playlist(self, source: str, sl_id: str) -> Playlist:
-        """广场歌单：用 songList/detail 拉取歌曲。"""
+    def _make_square_playlist(self, source: str, sl_id: str) -> Playlist:
+        """广场歌单元数据：用 _square_meta 缓存回填名字与封面。"""
         item_id = f"sl:{source}:{sl_id}"
+        meta = self._square_meta.get(item_id, {})
         playlist = Playlist(
             item_id=item_id,
             provider=self.instance_id,
-            name=sl_id,
+            name=meta.get("name") or sl_id,
             provider_mappings={
                 ProviderMapping(
                     item_id=item_id,
@@ -718,19 +829,60 @@ class LxMusicProvider(MusicProvider):
                 )
             },
         )
-        try:
-            items = await self._fetch_paged(
-                "/api/music/songList/detail",
-                {"source": source, "id": sl_id},
-                max_items=100,
-            )
-            for item in items:
+        if meta.get("img"):
+            playlist.metadata.images = [
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=meta["img"],
+                    provider=self.instance_id,
+                    remotely_accessible=True,
+                )
+            ]
+        return playlist
+
+    async def get_playlist_tracks(
+        self, prov_playlist_id: str, page: int = 0
+    ) -> list[Track]:
+        """返回歌单内的曲目（当前 MA 协议：曲目与元数据分离，且按 page 分页）。
+
+        MA 的 playlists.tracks() 会以 page=0,1,2... 递增调用本方法，直到某页返回
+        空列表才停止。因此这里必须按 page 切片返回，否则会陷入无限循环、导致 UI
+        一直拿不到完整曲目列表（表现为歌单打开后没有歌曲）。
+        """
+        page_size = 100
+        start = page * page_size
+        if prov_playlist_id.startswith("sl:"):
+            parts = prov_playlist_id.split(":", 2)
+            source = parts[1] if len(parts) > 1 else self._default_source
+            sl_id = parts[2] if len(parts) > 2 else ""
+            try:
+                items = await self._fetch_paged(
+                    "/api/music/songList/detail",
+                    {"source": source, "id": sl_id},
+                    max_items=1000,
+                )
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("广场歌单详情失败 %s: %s", prov_playlist_id, err)
+                return []
+            out: list[Track] = []
+            for item in items[start : start + page_size]:
                 track = await self._parse_track(item, source)
                 if track:
-                    playlist.tracks.append(track)
-        except Exception as err:  # noqa: BLE001
-            LOGGER.debug("广场歌单详情失败 %s: %s", item_id, err)
-        return playlist
+                    out.append(track)
+            return out
+
+        # 用户歌单：优先用缓存的歌曲列表
+        songs = self._playlist_cache.get(prov_playlist_id)
+        if songs is None:
+            await self.get_playlist(prov_playlist_id)
+            songs = self._playlist_cache.get(prov_playlist_id, [])
+        out = []
+        for item in songs[start : start + page_size]:
+            src = item.get("source") or self._default_source
+            track = await self._parse_track(item, src)
+            if track:
+                out.append(track)
+        return out
 
     async def get_stream_details(
         self, item_id: str, media_type: MediaType = MediaType.TRACK
