@@ -1,3 +1,4 @@
+# fix: 兼容MA 2.10.x Lxmusic 洛雪插件 v1.2.0 浏览支持查看排行榜和广场歌单，自动导入收藏和自建歌单
 # LX Music Provider for Music Assistant
 
 将 [LX Music（洛雪音乐）](https://github.com/xcq0607/lxserver) 的 Docker 服务端作为
