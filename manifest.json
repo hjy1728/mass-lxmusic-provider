@@ -4,10 +4,14 @@
   "stage": "experimental",
   "name": "LX Music Server",
   "description": "Stream music from a self-hosted LX Music server (lxserver): cross-source search, lyrics, leaderboards, playlists and daily picks.",
-  "codeowners": ["@andychao2024"],
-  "requirements": ["aiohttp>=3.8.0"],
+  "codeowners": [
+    "@andychao2024"
+  ],
+  "requirements": [
+    "aiohttp>=3.8.0"
+  ],
   "documentation": "https://github.com/andychao2024/music-assistant-providers",
   "multi_instance": true,
   "has_setup_flow": true,
-  "version": "1.4.0"
+  "version": "1.5.1"
 }
